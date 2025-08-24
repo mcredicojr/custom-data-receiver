@@ -1,6 +1,27 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added (planned for v0.3.0)
+- Dashboard: image thumbnails column when `images.path` is present.
+- Dashboard: link to `/events/{id}` detail page.
+- Event details page: show normalized fields plus all `event_fields` keys/values.
+- API: `GET /events/{id}` to fetch a single event and its fields/images.
+
+### Changed (planned)
+- UI: improved time formatting and auto-refresh cadence configurable.
+
+
+- add next steps checklist under Unreleased### Fixed (planned)
+- Better resilience on image worker retries and error messages.
+
+### Tasks
+- [ ] Add `/events/{id}` API (event + `event_fields` + `images`).
+- [ ] Add `/events/{id}` HTML page with metadata table and thumbnails.
+- [ ] Add thumbnails column to `/dashboard` (if `images.path` exists).
+- [ ] Image worker: bump retry backoff + max attempts; surface errors in UI.
+- [ ] Optional: toggle to show Occurred vs Created time in dashboard.
 
 ## [Unreleased]
 
@@ -24,7 +45,8 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - add next steps checklist under Unreleased
 
-### Fixed
+
+- add next steps checklist under Unreleased### Fixed
 - None
 ## [0.2.0] - 2025-08-24
 ### Added
