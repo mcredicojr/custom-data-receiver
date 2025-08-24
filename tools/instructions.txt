@@ -1,0 +1,23 @@
+Recommended daily flow (super simple)
+
+Code normally.
+
+When you’re done for the day:
+
+pwsh .\tools\dev-commit.ps1 -Type feat -Message "add /events API and dashboard skeleton"
+
+
+When you hit a milestone:
+
+pwsh .\tools\release.ps1 -Version 0.1.0
+
+
+The reminder I set will ping you at 5pm to run those.
+
+Usage examples:
+
+# Feature
+pwsh .\tools\dev-commit.ps1 -Type feat -Message "add config loader and sqlite migrations"
+
+# Bug fix
+pwsh .\tools\dev-commit.ps1 -Type fix -Message "handle empty token path in rekor endpoint"
