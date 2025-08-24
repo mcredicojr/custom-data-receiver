@@ -3,6 +3,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-08-24
+### Added
+- Support for Rekor image fetching from police.openalpr.com using `{agent_uid}` and `${REKOR_API_KEY}` expansion.
+- Webhook handler now stores `agent_uid` and captures inline images (base64 or URL) immediately.
+- Config option `path_template` for images (default example uses `/img/{agent_uid}/{uuid}?api_key=${REKOR_API_KEY}`).
+
+
 ### Added (planned for v0.3.0)
 - Dashboard: image thumbnails column when `images.path` is present.
 - Dashboard: link to `/events/{id}` detail page.
