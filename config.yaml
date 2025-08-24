@@ -29,6 +29,6 @@ providers:
       - gps.lat
       - gps.lon
     images:
-      fetch_enabled: false
+      fetch_enabled: true
       base_url: "http://AGENT_IP:8355"
       auth_header: ""

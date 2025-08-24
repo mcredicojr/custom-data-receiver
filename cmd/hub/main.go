@@ -1,6 +1,7 @@
 ﻿package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -15,12 +16,13 @@ import (
 	"strings"
 
 	"github.com/mcredicojr/custom-data-receiver/internal/config"
+	"github.com/mcredicojr/custom-data-receiver/internal/services"
 	"github.com/mcredicojr/custom-data-receiver/internal/storage"
 )
 
 type RekorNormalized struct {
 	EventType  string   `json:"event_type,omitempty"`
-	OccurredAt string   `json:"occurred_at,omitempty"`
+	OccurredAt string   `json:"occurred_at,omitempty"` // epoch ms as string if available
 	CameraID   string   `json:"camera_id,omitempty"`
 	CameraName string   `json:"camera_name,omitempty"`
 	Plate      string   `json:"plate,omitempty"`
@@ -75,6 +77,10 @@ func main() {
 		log.Fatal("apply migrations:", err)
 	}
 
+	// Start image worker (does nothing unless jobs are queued)
+	ctx, _ := context.WithCancel(context.Background())
+	go services.StartImageWorker(ctx, db.SQL, "./data")
+
 	mux := http.NewServeMux()
 
 	// Health
@@ -109,32 +115,121 @@ func main() {
 		h := sha256.Sum256(append([]byte("rekor:"), body...))
 		hash := hex.EncodeToString(h[:])
 
-		// best-effort normalization (payloads differ)
+		// Parse payload
 		var payload map[string]any
 		_ = json.Unmarshal(body, &payload)
 
-		norm := RekorNormalized{
-			EventType: getString(payload, "data_type"),
-		}
+		// Normalize
+		dt := getString(payload, "data_type")
+		norm := RekorNormalized{EventType: dt}
+
+		// plate
 		if v := getStringDeep(payload, []string{"best_plate", "plate"}); v != "" {
 			norm.Plate = v
 		} else if v := getStringDeep(payload, []string{"results", "0", "plate"}); v != "" {
 			norm.Plate = v
+		} else if dt == "alpr_alert" {
+			if v := getString(payload, "plate_number"); v != "" {
+				norm.Plate = v
+			}
 		}
+
+		// confidence
 		if c := getFloatDeep(payload, []string{"best_plate", "confidence"}); c != nil {
 			norm.Confidence = *c
 		}
+
+		// region/country
 		if rgn := getStringDeep(payload, []string{"best_plate", "region"}); rgn != "" {
 			norm.Region = rgn
+		} else if rgn := getString(payload, "region"); rgn != "" {
+			norm.Region = rgn
+		} else if rgn := getString(payload, "country"); rgn != "" {
+			norm.Region = rgn
 		}
+
+		// camera
 		if cam := getString(payload, "camera_name"); cam != "" {
 			norm.CameraName = cam
 		}
-		if ts := getStringDeep(payload, []string{"epoch", "start"}); ts != "" {
-			norm.OccurredAt = ts
+		if cid := getString(payload, "camera_id"); cid != "" {
+			norm.CameraID = cid
+		} else if cid := getString(payload, "camera_number"); cid != "" {
+			norm.CameraID = cid
 		}
-		norm.Lat = getFloatDeep(payload, []string{"gps", "latitude"})
-		norm.Lon = getFloatDeep(payload, []string{"gps", "longitude"})
+
+		// occurred_at (epoch ms as string)
+		if dt == "alpr_alert" {
+			if ms := getFloatDeep(payload, []string{"epoch_time"}); ms != nil {
+				norm.OccurredAt = fmt.Sprintf("%.0f", *ms)
+			}
+		} else {
+			if ms := getFloatDeep(payload, []string{"epoch_end"}); ms != nil {
+				norm.OccurredAt = fmt.Sprintf("%.0f", *ms)
+			} else if ms := getFloatDeep(payload, []string{"epoch_start"}); ms != nil {
+				norm.OccurredAt = fmt.Sprintf("%.0f", *ms)
+			}
+		}
+
+		// GPS (root or nested)
+		if f := getFloatDeep(payload, []string{"gps", "latitude"}); f != nil {
+			norm.Lat = f
+		} else if f := getFloatDeep(payload, []string{"gps_latitude"}); f != nil {
+			norm.Lat = f
+		}
+		if f := getFloatDeep(payload, []string{"gps", "longitude"}); f != nil {
+			norm.Lon = f
+		} else if f := getFloatDeep(payload, []string{"gps_longitude"}); f != nil {
+			norm.Lon = f
+		}
+
+		// alert metadata & group uuids
+		var (
+			alertList   = getString(payload, "alert_list")
+			alertListID = getString(payload, "alert_list_id")
+			listType    = getString(payload, "list_type")
+			siteName    = getString(payload, "site_name")
+			uuids       []string
+		)
+
+		if dt == "alpr_alert" {
+			if g, ok := payload["group"].(map[string]any); ok {
+				// plate fallback from group
+				if norm.Plate == "" {
+					if v := getStringDeep(g, []string{"best_plate", "plate"}); v != "" {
+						norm.Plate = v
+					}
+				}
+				// uuids from group
+				if v, ok := g["uuids"].([]any); ok {
+					for _, u := range v {
+						if s, ok2 := u.(string); ok2 && s != "" {
+							uuids = append(uuids, s)
+						}
+					}
+				}
+				// GPS fallback from group
+				if norm.Lat == nil {
+					if f := getFloatDeep(g, []string{"gps_latitude"}); f != nil {
+						norm.Lat = f
+					}
+				}
+				if norm.Lon == nil {
+					if f := getFloatDeep(g, []string{"gps_longitude"}); f != nil {
+						norm.Lon = f
+					}
+				}
+			}
+		} else {
+			// alpr_group: uuids at top-level
+			if v, ok := payload["uuids"].([]any); ok {
+				for _, u := range v {
+					if s, ok2 := u.(string); ok2 && s != "" {
+						uuids = append(uuids, s)
+					}
+				}
+			}
+		}
 
 		// ensure provider row exists
 		var providerID int64
@@ -165,6 +260,53 @@ func main() {
 			log.Println("event insert error:", err)
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
+		}
+
+		// Look up event id by hash
+		var eventID int64
+		if err := db.SQL.QueryRow(`SELECT id FROM events WHERE hash=?`, hash).Scan(&eventID); err != nil {
+			log.Println("event id lookup error:", err)
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+
+		// Save alert metadata into event_fields (schema-free)
+		saveField := func(key, val string) {
+			if val == "" {
+				return
+			}
+			_, _ = db.SQL.Exec(`INSERT INTO event_fields(event_id, key, value) VALUES(?,?,?)`, eventID, key, val)
+		}
+		if alertList != "" {
+			saveField("alert.list", alertList)
+		}
+		if alertListID != "" {
+			saveField("alert.list_id", alertListID)
+		}
+		if listType != "" {
+			saveField("alert.list_type", listType)
+		}
+		if siteName != "" {
+			saveField("alert.site_name", siteName)
+		}
+		if norm.OccurredAt != "" {
+			saveField("occurred_at_ms", norm.OccurredAt)
+		}
+
+		// Insert image UUIDs and (optionally) enqueue fetch jobs
+		for _, uuid := range uuids {
+			_, _ = db.SQL.Exec(`INSERT INTO images(event_id, kind, uuid, status) VALUES(?, 'frame', ?, 'pending')`, eventID, uuid)
+
+			if cfg.Providers.Rekor.Images.FetchEnabled && cfg.Providers.Rekor.Images.BaseURL != "" {
+				args := services.ImageFetchArgs{
+					EventID:    eventID,
+					UUID:       uuid,
+					BaseURL:    cfg.Providers.Rekor.Images.BaseURL,
+					AuthHeader: cfg.Providers.Rekor.Images.AuthHeader,
+				}
+				b, _ := json.Marshal(args)
+				_, _ = db.SQL.Exec(`INSERT INTO jobs(type, args_json, status) VALUES('image_fetch', ?, 'queued')`, string(b))
+			}
 		}
 
 		jsonOK(w, map[string]string{"status": "stored"})
@@ -285,7 +427,7 @@ func main() {
 		})
 	})
 
-	// /dashboard: minimal HTML page that calls /events
+	// Dashboard
 	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(dashboardHTML))
@@ -322,6 +464,7 @@ func getString(m map[string]any, key string) string {
 	}
 	return ""
 }
+
 func getStringDeep(m map[string]any, path []string) string {
 	cur := any(m)
 	for _, p := range path {
@@ -339,6 +482,7 @@ func getStringDeep(m map[string]any, path []string) string {
 	}
 	return ""
 }
+
 func getFloatDeep(m map[string]any, path []string) *float64 {
 	cur := any(m)
 	for _, p := range path {
@@ -354,12 +498,14 @@ func getFloatDeep(m map[string]any, path []string) *float64 {
 	}
 	return nil
 }
+
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil
 	}
 	return s
 }
+
 func nullIfZero(f float64) any {
 	if f == 0 {
 		return nil
@@ -368,86 +514,99 @@ func nullIfZero(f float64) any {
 }
 
 const dashboardHTML = "<!doctype html>\n" +
-"<html>\n" +
-"<head>\n" +
-"  <meta charset=\"utf-8\">\n" +
-"  <title>Custom Data Receiver — Dashboard</title>\n" +
-"  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n" +
-"  <style>\n" +
-"    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }\n" +
-"    h1 { margin: 0 0 16px; }\n" +
-"    .controls { display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap; }\n" +
-"    input, select, button { padding:8px; font-size:14px; }\n" +
-"    table { border-collapse: collapse; width: 100%; }\n" +
-"    th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; }\n" +
-"    th { background: #f8f8f8; position: sticky; top: 0; }\n" +
-"    .muted { color: #666; font-size: 12px; }\n" +
-"  </style>\n" +
-"</head>\n" +
-"<body>\n" +
-"  <h1>Events</h1>\n" +
-"  <div class=\"controls\">\n" +
-"    <label>Provider\n" +
-"      <select id=\"provider\">\n" +
-"        <option value=\"\">(all)</option>\n" +
-"        <option value=\"rekor\">rekor</option>\n" +
-"      </select>\n" +
-"    </label>\n" +
-"    <input id=\"plate\" placeholder=\"Plate filter (contains)\" />\n" +
-"    <input id=\"q\" placeholder=\"Search (plate/camera/region)\" />\n" +
-"    <button id=\"refresh\">Refresh</button>\n" +
-"  </div>\n" +
-"  <div class=\"muted\" id=\"meta\"></div>\n" +
-"  <table id=\"tbl\">\n" +
-"    <thead>\n" +
-"      <tr>\n" +
-"        <th>Time (created)</th>\n" +
-"        <th>Provider</th>\n" +
-"        <th>Event Type</th>\n" +
-"        <th>Plate</th>\n" +
-"        <th>Conf</th>\n" +
-"        <th>Camera</th>\n" +
-"        <th>Region</th>\n" +
-"        <th>Lat</th>\n" +
-"        <th>Lon</th>\n" +
-"      </tr>\n" +
-"    </thead>\n" +
-"    <tbody></tbody>\n" +
-"  </table>\n" +
-"<script>\n" +
-"function esc(x){return (x===null||x===undefined)?'':String(x)}\n" +
-"async function load() {\n" +
-"  const provider = document.getElementById('provider').value.trim();\n" +
-"  const plate = document.getElementById('plate').value.trim();\n" +
-"  const q = document.getElementById('q').value.trim();\n" +
-"  const params = new URLSearchParams({ page: '1', page_size: '100' });\n" +
-"  if (provider) params.set('provider', provider);\n" +
-"  if (plate) params.set('plate', plate);\n" +
-"  if (q) params.set('q', q);\n" +
-"\n" +
-"  const res = await fetch('/events?' + params.toString());\n" +
-"  const data = await res.json();\n" +
-"\n" +
-"  document.getElementById('meta').textContent = 'Showing ' + (data.events?.length || 0) + ' event(s) — page ' + data.page + ' of unknown';\n" +
-"\n" +
-"  const tbody = document.querySelector('#tbl tbody');\n" +
-"  tbody.innerHTML = '';\n" +
-"  for (const e of (data.events || [])) {\n" +
-"    const tr = document.createElement('tr');\n" +
-"    tr.innerHTML = '<td>' + esc(e.created_at) + '</td>' +\n" +
-"                   '<td>' + esc(e.provider) + '</td>' +\n" +
-"                   '<td>' + esc(e.event_type) + '</td>' +\n" +
-"                   '<td>' + esc(e.plate) + '</td>' +\n" +
-"                   '<td>' + esc(e.confidence) + '</td>' +\n" +
-"                   '<td>' + esc(e.camera_name) + '</td>' +\n" +
-"                   '<td>' + esc(e.region) + '</td>' +\n" +
-"                   '<td>' + esc(e.lat) + '</td>' +\n" +
-"                   '<td>' + esc(e.lon) + '</td>';\n" +
-"    tbody.appendChild(tr);\n" +
-"  }\n" +
-"}\n" +
-"document.getElementById('refresh').addEventListener('click', load);\n" +
-"load();\n" +
-"</script>\n" +
-"</body>\n" +
-"</html>\n"
+	"<html>\n" +
+	"<head>\n" +
+	"  <meta charset=\"utf-8\">\n" +
+	"  <title>Custom Data Receiver — Dashboard</title>\n" +
+	"  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n" +
+	"  <style>\n" +
+	"    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }\n" +
+	"    h1 { margin: 0 0 16px; }\n" +
+	"    .controls { display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap; }\n" +
+	"    input, select, button { padding:8px; font-size:14px; }\n" +
+	"    table { border-collapse: collapse; width: 100%; }\n" +
+	"    th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; }\n" +
+	"    th { background: #f8f8f8; position: sticky; top: 0; }\n" +
+	"    .muted { color: #666; font-size: 12px; }\n" +
+	"    .right { text-align:right; }\n" +
+	"  </style>\n" +
+	"</head>\n" +
+	"<body>\n" +
+	"  <h1>Events</h1>\n" +
+	"  <div class=\"controls\">\n" +
+	"    <label>Provider\n" +
+	"      <select id=\"provider\">\n" +
+	"        <option value=\"\">(all)</option>\n" +
+	"        <option value=\"rekor\">rekor</option>\n" +
+	"      </select>\n" +
+	"    </label>\n" +
+	"    <input id=\"plate\" placeholder=\"Plate filter (contains)\" />\n" +
+	"    <input id=\"q\" placeholder=\"Search (plate/camera/region)\" />\n" +
+	"    <button id=\"refresh\">Refresh</button>\n" +
+	"    <span class=\"muted\" id=\"status\"></span>\n" +
+	"  </div>\n" +
+	"  <div class=\"muted\" id=\"meta\"></div>\n" +
+	"  <table id=\"tbl\">\n" +
+	"    <thead>\n" +
+	"      <tr>\n" +
+	"        <th>Time (created)</th>\n" +
+	"        <th>Provider</th>\n" +
+	"        <th>Event Type</th>\n" +
+	"        <th>Plate</th>\n" +
+	"        <th class=\"right\">Conf</th>\n" +
+	"        <th>Camera</th>\n" +
+	"        <th>Region</th>\n" +
+	"        <th>Lat</th>\n" +
+	"        <th>Lon</th>\n" +
+	"      </tr>\n" +
+	"    </thead>\n" +
+	"    <tbody></tbody>\n" +
+	"  </table>\n" +
+	"<script>\n" +
+	"function esc(x){return (x===null||x===undefined)?'':String(x)}\n" +
+	"function fmtLocal(ts){\n" +
+	"  try{\n" +
+	"    if(!ts) return '';\n" +
+	"    if(/^\\d{13}$/.test(String(ts))){ const d=new Date(Number(ts)); if(!isNaN(d)) return d.toLocaleString(); }\n" +
+	"    if(/^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d+)?$/.test(ts)){ const d=new Date(ts.replace(' ','T')); if(!isNaN(d)) return d.toLocaleString(); }\n" +
+	"    const d=new Date(ts); if(!isNaN(d)) return d.toLocaleString();\n" +
+	"    return esc(ts);\n" +
+	"  }catch(e){ return esc(ts); }\n" +
+	"}\n" +
+	"async function load() {\n" +
+	"  const provider = document.getElementById('provider').value.trim();\n" +
+	"  const plate = document.getElementById('plate').value.trim();\n" +
+	"  const q = document.getElementById('q').value.trim();\n" +
+	"  const params = new URLSearchParams({ page: '1', page_size: '100' });\n" +
+	"  if (provider) params.set('provider', provider);\n" +
+	"  if (plate) params.set('plate', plate);\n" +
+	"  if (q) params.set('q', q);\n" +
+	"  const status = document.getElementById('status');\n" +
+	"  status.textContent = 'Loading…';\n" +
+	"  const res = await fetch('/events?' + params.toString());\n" +
+	"  const data = await res.json();\n" +
+	"  status.textContent = 'Last updated ' + new Date().toLocaleTimeString();\n" +
+	"  document.getElementById('meta').textContent = 'Showing ' + (data.events?.length || 0) + ' event(s) — page ' + data.page;\n" +
+	"  const tbody = document.querySelector('#tbl tbody');\n" +
+	"  tbody.innerHTML = '';\n" +
+	"  for (const e of (data.events || [])) {\n" +
+	"    const tr = document.createElement('tr');\n" +
+	"    const conf = (e.confidence==null)?'':Number(e.confidence).toFixed(1);\n" +
+	"    tr.innerHTML = '<td>' + fmtLocal(e.created_at) + '</td>' +\n" +
+	"                   '<td>' + esc(e.provider) + '</td>' +\n" +
+	"                   '<td>' + esc(e.event_type) + '</td>' +\n" +
+	"                   '<td>' + esc(e.plate) + '</td>' +\n" +
+	"                   '<td class=\"right\">' + conf + '</td>' +\n" +
+	"                   '<td>' + esc(e.camera_name) + '</td>' +\n" +
+	"                   '<td>' + esc(e.region) + '</td>' +\n" +
+	"                   '<td>' + esc(e.lat) + '</td>' +\n" +
+	"                   '<td>' + esc(e.lon) + '</td>';\n" +
+	"    tbody.appendChild(tr);\n" +
+	"  }\n" +
+	"}\n" +
+	"document.getElementById('refresh').addEventListener('click', load);\n" +
+	"load();\n" +
+	"setInterval(load, 10000);\n" +
+	"</script>\n" +
+	"</body>\n" +
+	"</html>\n"

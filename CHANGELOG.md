@@ -3,7 +3,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 ### Added
-- None
+- rekor: alert-aware normalization, store alert metadata & image UUIDs, optional image fetch worker
 
 ### Changed
 - None
