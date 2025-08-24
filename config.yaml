@@ -1,16 +1,16 @@
-﻿server:
-  addr: ""127.0.0.1:8080""
-  public_base_url: """"
+server:
+  addr: "127.0.0.1:8080"
+  public_base_url: ""
 
 database:
-  driver: ""sqlite""
-  sqlite_path: ""./data/hub.db""
-  postgres_dsn: """"
+  driver: "sqlite"
+  sqlite_path: "./data/hub.db"
+  postgres_dsn: ""
 
 providers:
   rekor:
     enabled: true
-    token: Rekor_2025
+    token: "Rekor_2025"
     share_defaults:
       plate: true
       timestamp: true
@@ -30,5 +30,5 @@ providers:
       - gps.lon
     images:
       fetch_enabled: false
-      base_url: ""http://AGENT_IP:8355""
-      auth_header: """"
+      base_url: "http://AGENT_IP:8355"
+      auth_header: ""
