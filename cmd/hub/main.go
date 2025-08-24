@@ -4,16 +4,21 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mcredicojr/custom-data-receiver/internal/config"
 	"github.com/mcredicojr/custom-data-receiver/internal/services"
@@ -35,7 +40,7 @@ type RekorNormalized struct {
 type EventDTO struct {
 	ID         int64    `json:"id"`
 	Provider   string   `json:"provider"`
-	EventType  string   `json:"event_type"`
+	EventType  string   `json.json:"event_type"`
 	OccurredAt *string  `json:"occurred_at"`
 	CreatedAt  string   `json:"created_at"`
 	CameraID   *string  `json:"camera_id"`
@@ -48,7 +53,7 @@ type EventDTO struct {
 }
 
 func main() {
-	// Load config
+	// Load config (keep your real key in env, not here)
 	cfgPath := "config.yaml"
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
 		cfgPath = "config.example.yaml"
@@ -82,6 +87,10 @@ func main() {
 	go services.StartImageWorker(ctx, db.SQL, "./data")
 
 	mux := http.NewServeMux()
+
+	// Serve local images read-only from ./data/images at /images/
+	imgFS := http.FileServer(http.Dir("./data/images"))
+	mux.Handle("/images/", http.StripPrefix("/images/", imgFS))
 
 	// Health
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -189,6 +198,7 @@ func main() {
 			alertListID = getString(payload, "alert_list_id")
 			listType    = getString(payload, "list_type")
 			siteName    = getString(payload, "site_name")
+			agentUID    = getString(payload, "agent_uid")
 			uuids       []string
 		)
 
@@ -198,6 +208,12 @@ func main() {
 				if norm.Plate == "" {
 					if v := getStringDeep(g, []string{"best_plate", "plate"}); v != "" {
 						norm.Plate = v
+					}
+				}
+				// agent uid fallback from group
+				if agentUID == "" {
+					if v := getString(g, "agent_uid"); v != "" {
+						agentUID = v
 					}
 				}
 				// uuids from group
@@ -292,17 +308,43 @@ func main() {
 		if norm.OccurredAt != "" {
 			saveField("occurred_at_ms", norm.OccurredAt)
 		}
+		if agentUID != "" {
+			saveField("agent.uid", agentUID)
+		}
 
-		// Insert image UUIDs and (optionally) enqueue fetch jobs
+		// --- IMAGES FROM THE WEBHOOK (fast path) ---
+		// Common fields we've seen in the wild:
+		//  - "image_jpeg" or "img_jpeg": base64-encoded JPEG
+		//  - "image_url" at top-level or inside "group"
+		// We store them asynchronously so we don't block the webhook.
+		if b64 := getString(payload, "image_jpeg"); b64 != "" {
+			go saveBase64Image(db.SQL, eventID, b64, "") // name will be derived
+		} else if b64 := getString(payload, "img_jpeg"); b64 != "" {
+			go saveBase64Image(db.SQL, eventID, b64, "")
+		}
+		if u := getString(payload, "image_url"); u != "" {
+			go saveURLImage(db.SQL, eventID, u, "", "")
+		}
+		if g, ok := payload["group"].(map[string]any); ok {
+			if u := getString(g, "image_url"); u != "" {
+				go saveURLImage(db.SQL, eventID, u, "", "")
+			}
+		}
+
+		// --- UUID-BASED FETCH (fallback; police.openalpr.com requires agent_uid) ---
 		for _, uuid := range uuids {
+			// Create image row as pending; name will be uuid.jpg when fetched
 			_, _ = db.SQL.Exec(`INSERT INTO images(event_id, kind, uuid, status) VALUES(?, 'frame', ?, 'pending')`, eventID, uuid)
 
+			// If configured to fetch, enqueue job with path template & env expansion support
 			if cfg.Providers.Rekor.Images.FetchEnabled && cfg.Providers.Rekor.Images.BaseURL != "" {
 				args := services.ImageFetchArgs{
-					EventID:    eventID,
-					UUID:       uuid,
-					BaseURL:    cfg.Providers.Rekor.Images.BaseURL,
-					AuthHeader: cfg.Providers.Rekor.Images.AuthHeader,
+					EventID:      eventID,
+					UUID:         uuid,
+					BaseURL:      cfg.Providers.Rekor.Images.BaseURL,
+					AuthHeader:   cfg.Providers.Rekor.Images.AuthHeader,
+					PathTemplate: cfg.Providers.Rekor.Images.PathTemplate, // e.g. /img/{agent_uid}/{uuid}?api_key=${REKOR_API_KEY}
+					AgentUID:     agentUID,
 				}
 				b, _ := json.Marshal(args)
 				_, _ = db.SQL.Exec(`INSERT INTO jobs(type, args_json, status) VALUES('image_fetch', ?, 'queued')`, string(b))
@@ -336,7 +378,6 @@ func main() {
 			args = append(args, "%"+plate+"%")
 		}
 		if q := strings.TrimSpace(r.URL.Query().Get("q")); q != "" {
-			// simple search across plate, camera_name, region
 			where = append(where, "(events.plate LIKE ? OR events.camera_name LIKE ? OR events.region LIKE ?)")
 			args = append(args, "%"+q+"%", "%"+q+"%", "%"+q+"%")
 		}
@@ -427,6 +468,127 @@ func main() {
 		})
 	})
 
+	// API: GET /events/{id}
+	mux.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) != 2 || parts[0] != "events" {
+			http.NotFound(w, r)
+			return
+		}
+		id, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || id <= 0 {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+
+		var e EventDTO
+		var occurred sql.NullString
+		var cameraID, camName, plate, region sql.NullString
+		var conf sql.NullFloat64
+		var lat, lon sql.NullFloat64
+
+		row := db.SQL.QueryRow(`
+			SELECT
+				events.id,
+				providers.key as provider,
+				COALESCE(events.event_type,'') as event_type,
+				events.occurred_at,
+				events.created_at,
+				events.camera_id,
+				events.camera_name,
+				events.plate,
+				events.confidence,
+				events.region,
+				events.lat,
+				events.lon
+			FROM events
+			JOIN providers ON providers.id = events.provider_id
+			WHERE events.id = ?
+		`, id)
+		if err := row.Scan(&e.ID, &e.Provider, &e.EventType, &occurred, &e.CreatedAt, &cameraID, &camName, &plate, &conf, &region, &lat, &lon); err != nil {
+			if err == sql.ErrNoRows {
+				http.NotFound(w, r)
+				return
+			}
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if occurred.Valid {
+			e.OccurredAt = &occurred.String
+		}
+		if cameraID.Valid {
+			s := cameraID.String
+			e.CameraID = &s
+		}
+		if camName.Valid {
+			s := camName.String
+			e.CameraName = &s
+		}
+		if plate.Valid {
+			s := plate.String
+			e.Plate = &s
+		}
+		if conf.Valid {
+			v := conf.Float64
+			e.Confidence = &v
+		}
+		if region.Valid {
+			s := region.String
+			e.Region = &s
+		}
+		if lat.Valid {
+			v := lat.Float64
+			e.Lat = &v
+		}
+		if lon.Valid {
+			v := lon.Float64
+			e.Lon = &v
+		}
+
+		// Fields
+		fields := []map[string]string{}
+		if fr, err := db.SQL.Query(`SELECT key, value FROM event_fields WHERE event_id = ? ORDER BY key`, id); err == nil {
+			defer fr.Close()
+			for fr.Next() {
+				var k, v string
+				_ = fr.Scan(&k, &v)
+				fields = append(fields, map[string]string{"key": k, "value": v})
+			}
+		}
+
+		// Images
+		images := []map[string]any{}
+		if ir, err := db.SQL.Query(`SELECT uuid, COALESCE(path,'') as path, status FROM images WHERE event_id = ? ORDER BY id`, id); err == nil {
+			defer ir.Close()
+			for ir.Next() {
+				var uuid, pathStr, status string
+				_ = ir.Scan(&uuid, &pathStr, &status)
+				publicPath := ""
+				if pathStr != "" {
+					publicPath = "/images/" + filepath.Base(pathStr)
+				}
+				images = append(images, map[string]any{"uuid": uuid, "image_url": publicPath, "status": status})
+			}
+		}
+
+		jsonOK(w, map[string]any{
+			"event":  e,
+			"fields": fields,
+			"images": images,
+		})
+	})
+
+	// HTML: /event/{id}
+	mux.HandleFunc("/event/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) != 2 || parts[0] != "event" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, eventHTML)
+	})
+
 	// Dashboard
 	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -465,9 +627,9 @@ func getString(m map[string]any, key string) string {
 	return ""
 }
 
-func getStringDeep(m map[string]any, path []string) string {
+func getStringDeep(m map[string]any, pth []string) string {
 	cur := any(m)
-	for _, p := range path {
+	for _, p := range pth {
 		switch c := cur.(type) {
 		case map[string]any:
 			cur = c[p]
@@ -483,9 +645,9 @@ func getStringDeep(m map[string]any, path []string) string {
 	return ""
 }
 
-func getFloatDeep(m map[string]any, path []string) *float64 {
+func getFloatDeep(m map[string]any, pth []string) *float64 {
 	cur := any(m)
-	for _, p := range path {
+	for _, p := range pth {
 		switch c := cur.(type) {
 		case map[string]any:
 			cur = c[p]
@@ -511,6 +673,132 @@ func nullIfZero(f float64) any {
 		return nil
 	}
 	return f
+}
+
+// --- image helpers (fast path from webhook) ---
+
+func ensureImagesDir() (string, error) {
+	root := filepath.Join(".", "data", "images")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+func saveBase64Image(db *sql.DB, eventID int64, b64 string, filename string) {
+	root, err := ensureImagesDir()
+	if err != nil {
+		log.Printf("images: mkdir error: %v", err)
+		return
+	}
+
+	// Some payloads include data URI prefix like "data:image/jpeg;base64,..."
+	if idx := strings.Index(b64, ","); idx > 0 && strings.Contains(b64[:idx], "base64") {
+		b64 = b64[idx+1:]
+	}
+
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		log.Printf("images: base64 decode error: %v", err)
+		return
+	}
+
+	if filename == "" {
+		sum := sha256.Sum256(data)
+		filename = hex.EncodeToString(sum[:]) + ".jpg"
+	} else if !strings.HasSuffix(strings.ToLower(filename), ".jpg") && !strings.HasSuffix(strings.ToLower(filename), ".jpeg") {
+		filename += ".jpg"
+	}
+
+	dst := filepath.Join(root, filepath.Base(filename))
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		log.Printf("images: write error: %v", err)
+		return
+	}
+
+	// Record or update images row (no uuid for base64 case)
+	_, _ = db.Exec(`INSERT INTO images(event_id, kind, uuid, path, status) VALUES(?, 'frame', '', ?, 'stored')`, eventID, dst)
+	log.Printf("images: stored base64 image -> %s", dst)
+}
+
+func saveURLImage(db *sql.DB, eventID int64, rawURL, desiredName, authHeader string) {
+	root, err := ensureImagesDir()
+	if err != nil {
+		log.Printf("images: mkdir error: %v", err)
+		return
+	}
+	// Validate URL
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		log.Printf("images: bad url %q: %v", rawURL, err)
+		return
+	}
+
+	// Name
+	name := desiredName
+	if name == "" {
+		base := path.Base(u.Path)
+		if base == "" || base == "/" || base == "." {
+			base = fmt.Sprintf("img-%d.jpg", time.Now().UnixNano())
+		}
+		name = base
+	}
+	dst := filepath.Join(root, filepath.Base(name))
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("images: panic recovering: %v", r)
+			}
+		}()
+
+		client := &http.Client{Timeout: 8 * time.Second}
+		req, _ := http.NewRequest("GET", rawURL, nil)
+		if strings.TrimSpace(authHeader) != "" {
+			parts := strings.SplitN(authHeader, ":", 2)
+			if len(parts) == 2 {
+				req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+			} else {
+				// If they provide "Authorization: Bearer ..." as a whole string,
+				// we still set it under Authorization
+				req.Header.Set("Authorization", authHeader)
+			}
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("images: GET %s error: %v", rawURL, err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			log.Printf("images: GET %s -> %d (%s)", rawURL, resp.StatusCode, strings.TrimSpace(string(msg)))
+			return
+		}
+		f, err := os.Create(dst)
+		if err != nil {
+			log.Printf("images: create %s error: %v", dst, err)
+			return
+		}
+		if _, err := io.Copy(f, resp.Body); err != nil {
+			_ = f.Close()
+			log.Printf("images: copy error: %v", err)
+			return
+		}
+		_ = f.Close()
+
+		_, _ = db.Exec(`INSERT INTO images(event_id, kind, uuid, path, status) VALUES(?, 'frame', '', ?, 'stored')`, eventID, dst)
+		log.Printf("images: stored url image -> %s", dst)
+	}()
+}
+
+// (optional) tiny util if we ever need it here; worker already has its own logic
+func requireEnv(key string) (string, error) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return "", errors.New("missing env: " + key)
+	}
+	return val, nil
 }
 
 const dashboardHTML = "<!doctype html>\n" +
@@ -592,7 +880,8 @@ const dashboardHTML = "<!doctype html>\n" +
 	"  for (const e of (data.events || [])) {\n" +
 	"    const tr = document.createElement('tr');\n" +
 	"    const conf = (e.confidence==null)?'':Number(e.confidence).toFixed(1);\n" +
-	"    tr.innerHTML = '<td>' + fmtLocal(e.created_at) + '</td>' +\n" +
+	"    const details = '<a href=\"/event/' + e.id + '\">Details</a>';\n" +
+	"    tr.innerHTML = '<td>' + fmtLocal(e.created_at) + ' ' + details + '</td>' +\n" +
 	"                   '<td>' + esc(e.provider) + '</td>' +\n" +
 	"                   '<td>' + esc(e.event_type) + '</td>' +\n" +
 	"                   '<td>' + esc(e.plate) + '</td>' +\n" +
@@ -610,3 +899,31 @@ const dashboardHTML = "<!doctype html>\n" +
 	"</script>\n" +
 	"</body>\n" +
 	"</html>\n"
+
+const eventHTML = "<!doctype html>\n" +
+	"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>\n" +
+	"<title>Event</title>\n" +
+	"<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #ddd;padding:8px;text-align:left}th{background:#f8f8f8;position:sticky;top:0}.thumb{height:100px}</style>\n" +
+	"</head><body>\n" +
+	"<a href='/dashboard'>&larr; Back</a>\n" +
+	"<h1>Event Details</h1>\n" +
+	"<div id='meta'></div>\n" +
+	"<h2>Images</h2><div id='imgs'></div>\n" +
+	"<h2>Fields</h2>\n" +
+	"<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody id='fields'></tbody></table>\n" +
+	"<script>\n" +
+	"function esc(x){return (x===null||x===undefined)?'':String(x)}\n" +
+	"async function load(){\n" +
+	"  const id = location.pathname.split('/').pop();\n" +
+	"  const res = await fetch('/events/'+id);\n" +
+	"  const data = await res.json();\n" +
+	"  const e = data.event || {};\n" +
+	"  document.getElementById('meta').innerHTML = '<b>ID</b>: '+esc(e.id)+' &nbsp; <b>Provider</b>: '+esc(e.provider)+' &nbsp; <b>Type</b>: '+esc(e.event_type)+'<br><b>Plate</b>: '+esc(e.plate)+' &nbsp; <b>Camera</b>: '+esc(e.camera_name)+'<br><b>Created</b>: '+esc(e.created_at)+' &nbsp; <b>Occurred</b>: '+esc(e.occurred_at)+'<br><b>Region</b>: '+esc(e.region)+' &nbsp; <b>Conf</b>: '+esc(e.confidence)+' &nbsp; <b>GPS</b>: '+esc(e.lat)+', '+esc(e.lon);\n" +
+	"  const imgDiv = document.getElementById('imgs'); imgDiv.innerHTML='';\n" +
+	"  (data.images||[]).forEach(img=>{ const d=document.createElement('div'); d.style.display='inline-block'; d.style.margin='4px'; d.innerHTML = (img.image_url?('<img class=\"thumb\" src=\"'+img.image_url+'\"/>'):'(pending)') + '<br>'+esc(img.uuid)+'<br><span style=\"color:#666\">'+esc(img.status)+'</span>'; imgDiv.appendChild(d); });\n" +
+	"  const tb = document.getElementById('fields'); tb.innerHTML='';\n" +
+	"  (data.fields||[]).forEach(f=>{ const tr=document.createElement('tr'); tr.innerHTML='<td>'+esc(f.key)+'</td><td>'+esc(f.value)+'</td>'; tb.appendChild(tr); });\n" +
+	"}\n" +
+	"load();\n" +
+	"</script>\n" +
+	"</body></html>\n"
