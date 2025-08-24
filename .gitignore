@@ -1,0 +1,15 @@
+﻿# Binaries and build
+bin/
+dist/
+*.exe
+*.dll
+
+# Go
+vendor/
+coverage/
+*.out
+
+# Local data/config
+data/
+.env
+*.db

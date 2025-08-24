@@ -1,0 +1,34 @@
+﻿server:
+  addr: ""127.0.0.1:8080""
+  public_base_url: """"
+
+database:
+  driver: ""sqlite""
+  sqlite_path: ""./data/hub.db""
+  postgres_dsn: """"
+
+providers:
+  rekor:
+    enabled: true
+    token: ""change-me""
+    share_defaults:
+      plate: true
+      timestamp: true
+      camera_name: true
+      confidence: true
+      gps: false
+      images: false
+    index_fields:
+      - plate
+      - confidence
+      - region
+      - camera.name
+      - vehicle.color
+      - vehicle.make
+      - vehicle.model
+      - gps.lat
+      - gps.lon
+    images:
+      fetch_enabled: false
+      base_url: ""http://AGENT_IP:8355""
+      auth_header: """"
