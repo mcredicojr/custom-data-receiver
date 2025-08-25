@@ -2,6 +2,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- sqlite: enable WAL and busy_timeout(5s), and serialize connections to prevent SQLITE_BUSY under concurrent inserts.
+
+## [Unreleased]
 
 ## [0.3.0] - 2025-08-24
 ### Added
@@ -10,7 +13,8 @@ All notable changes to this project will be documented in this file.
 - Config option `path_template` for images (default example uses `/img/{agent_uid}/{uuid}?api_key=${REKOR_API_KEY}`).
 
 
-### Added (planned for v0.3.0)
+
+- rekor: image fetch worker, YAML env key support, debug endpoints### Added (planned for v0.3.0)
 - Dashboard: image thumbnails column when `images.path` is present.
 - Dashboard: link to `/events/{id}` detail page.
 - Event details page: show normalized fields plus all `event_fields` keys/values.
@@ -47,7 +51,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 ### Added
-- None
+- rekor: image fetch worker, YAML env key support, debug endpoints
 
 ### Changed
 - add next steps checklist under Unreleased

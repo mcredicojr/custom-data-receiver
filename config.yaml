@@ -29,6 +29,7 @@ providers:
       - gps.lat
       - gps.lon
     images:
+      base_url: "https://police.openalpr.com"
+      path_template: "/img/{agent_uid}/{uuid}.jpeg?api_key=${REKOR_API_KEY}"
       fetch_enabled: true
-      base_url: "http://AGENT_IP:8355"
-      auth_header: ""
+      auth_header: "env REKOR_API_KEY=e397c9079becc818068b7fc9746a50b1850280a7"

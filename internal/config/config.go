@@ -12,7 +12,7 @@ type ServerConf struct {
 }
 
 type DBConf struct {
-	Driver      string `yaml:"driver"`       // "sqlite" or "postgres"
+	Driver      string `yaml:"driver"` // "sqlite" or "postgres"
 	SQLitePath  string `yaml:"sqlite_path"`
 	PostgresDSN string `yaml:"postgres_dsn"`
 }
@@ -21,6 +21,7 @@ type RekorImagesConf struct {
 	FetchEnabled bool   `yaml:"fetch_enabled"`
 	BaseURL      string `yaml:"base_url"`
 	AuthHeader   string `yaml:"auth_header"`
+	PathTemplate string `yaml:"path_template"` // NEW: e.g. "/img/{agent_uid}/{uuid}.jpeg?api_key=${REKOR_API_KEY}"
 }
 
 type RekorShareDefaults struct {

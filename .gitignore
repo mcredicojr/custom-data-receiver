@@ -13,3 +13,4 @@ coverage/
 data/
 .env
 *.db
+config.yaml

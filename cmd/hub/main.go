@@ -40,7 +40,7 @@ type RekorNormalized struct {
 type EventDTO struct {
 	ID         int64    `json:"id"`
 	Provider   string   `json:"provider"`
-	EventType  string   `json.json:"event_type"`
+	EventType  string   `json:"event_type"`
 	OccurredAt *string  `json:"occurred_at"`
 	CreatedAt  string   `json:"created_at"`
 	CameraID   *string  `json:"camera_id"`
@@ -53,7 +53,7 @@ type EventDTO struct {
 }
 
 func main() {
-	// Load config (keep your real key in env, not here)
+	// Load config
 	cfgPath := "config.yaml"
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
 		cfgPath = "config.example.yaml"
@@ -62,6 +62,9 @@ func main() {
 	if err != nil {
 		log.Fatal("config load:", err)
 	}
+
+	// Optional: seed env var from YAML if user placed API key there
+	seedEnvFromYAML(cfg)
 
 	// Open DB
 	var db *storage.DB
@@ -96,6 +99,90 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	// DEBUG: show current Rekor image config + whether env is present (redacted)
+	mux.HandleFunc("/debug/config", func(w http.ResponseWriter, r *http.Request) {
+		type out struct {
+			BaseURL      string `json:"base_url"`
+			PathTemplate string `json:"path_template"`
+			AuthHeader   string `json:"auth_header"`
+			HasEnvKey    bool   `json:"has_env_key"`
+		}
+		ah := cfg.Providers.Rekor.Images.AuthHeader
+		redacted := ah
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(ah)), "env ") {
+			// show literally what YAML carries (it's not a token itself)
+		} else if len(ah) > 12 {
+			redacted = ah[:12] + "…redacted…"
+		}
+		resp := out{
+			BaseURL:      cfg.Providers.Rekor.Images.BaseURL,
+			PathTemplate: cfg.Providers.Rekor.Images.PathTemplate,
+			AuthHeader:   redacted,
+			HasEnvKey:    os.Getenv("REKOR_API_KEY") != "",
+		}
+		jsonOK(w, resp)
+	})
+
+	// DEBUG: show recent image jobs and last_error
+	mux.HandleFunc("/debug/queue", func(w http.ResponseWriter, r *http.Request) {
+		rows, err := db.SQL.Query(`
+			SELECT id, type, status, attempts, COALESCE(last_error,''), COALESCE(next_run_at,''), created_at, updated_at, args_json
+			  FROM jobs
+			 WHERE type='image_fetch'
+			 ORDER BY id DESC LIMIT 50`)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		type row struct {
+			ID        int64  `json:"id"`
+			Type      string `json:"type"`
+			Status    string `json:"status"`
+			Attempts  int64  `json:"attempts"`
+			LastError string `json:"last_error"`
+			NextRunAt string `json:"next_run_at"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
+			ArgsJSON  string `json:"args_json"`
+		}
+		var out []row
+		for rows.Next() {
+			var rr row
+			_ = rows.Scan(&rr.ID, &rr.Type, &rr.Status, &rr.Attempts, &rr.LastError, &rr.NextRunAt, &rr.CreatedAt, &rr.UpdatedAt, &rr.ArgsJSON)
+			out = append(out, rr)
+		}
+		jsonOK(w, map[string]any{"jobs": out})
+	})
+
+	// DEBUG: list images table
+	mux.HandleFunc("/debug/images", func(w http.ResponseWriter, r *http.Request) {
+		rows, err := db.SQL.Query(`
+			SELECT event_id, uuid, COALESCE(path,''), status, created_at, updated_at
+			  FROM images
+			 ORDER BY id DESC LIMIT 100`)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		type row struct {
+			EventID   int64  `json:"event_id"`
+			UUID      string `json:"uuid"`
+			Path      string `json:"path"`
+			Status    string `json:"status"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
+		}
+		var out []row
+		for rows.Next() {
+			var rr row
+			_ = rows.Scan(&rr.EventID, &rr.UUID, &rr.Path, &rr.Status, &rr.CreatedAt, &rr.UpdatedAt)
+			out = append(out, rr)
+		}
+		jsonOK(w, map[string]any{"images": out})
 	})
 
 	// Rekor webhook -> store JSON + normalized fields
@@ -313,12 +400,8 @@ func main() {
 		}
 
 		// --- IMAGES FROM THE WEBHOOK (fast path) ---
-		// Common fields we've seen in the wild:
-		//  - "image_jpeg" or "img_jpeg": base64-encoded JPEG
-		//  - "image_url" at top-level or inside "group"
-		// We store them asynchronously so we don't block the webhook.
 		if b64 := getString(payload, "image_jpeg"); b64 != "" {
-			go saveBase64Image(db.SQL, eventID, b64, "") // name will be derived
+			go saveBase64Image(db.SQL, eventID, b64, "")
 		} else if b64 := getString(payload, "img_jpeg"); b64 != "" {
 			go saveBase64Image(db.SQL, eventID, b64, "")
 		}
@@ -333,17 +416,15 @@ func main() {
 
 		// --- UUID-BASED FETCH (fallback; police.openalpr.com requires agent_uid) ---
 		for _, uuid := range uuids {
-			// Create image row as pending; name will be uuid.jpg when fetched
 			_, _ = db.SQL.Exec(`INSERT INTO images(event_id, kind, uuid, status) VALUES(?, 'frame', ?, 'pending')`, eventID, uuid)
 
-			// If configured to fetch, enqueue job with path template & env expansion support
 			if cfg.Providers.Rekor.Images.FetchEnabled && cfg.Providers.Rekor.Images.BaseURL != "" {
 				args := services.ImageFetchArgs{
 					EventID:      eventID,
 					UUID:         uuid,
 					BaseURL:      cfg.Providers.Rekor.Images.BaseURL,
 					AuthHeader:   cfg.Providers.Rekor.Images.AuthHeader,
-					PathTemplate: cfg.Providers.Rekor.Images.PathTemplate, // e.g. /img/{agent_uid}/{uuid}?api_key=${REKOR_API_KEY}
+					PathTemplate: cfg.Providers.Rekor.Images.PathTemplate, // e.g. /img/{agent_uid}/{uuid}.jpeg?api_key=${REKOR_API_KEY}
 					AgentUID:     agentUID,
 				}
 				b, _ := json.Marshal(args)
@@ -603,6 +684,24 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
 
+// If the YAML contains "auth_header: env REKOR_API_KEY=VALUE",
+// set the REKOR_API_KEY environment variable for this process.
+// This is ONLY for convenience when OS env isn’t set; it will not
+// send that literal value as an HTTP header.
+func seedEnvFromYAML(cfg *config.Config) {
+	v := strings.TrimSpace(cfg.Providers.Rekor.Images.AuthHeader)
+	if strings.HasPrefix(strings.ToLower(v), "env rekor_api_key=") {
+		parts := strings.SplitN(v, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[1])
+			if key != "" && os.Getenv("REKOR_API_KEY") == "" {
+				_ = os.Setenv("REKOR_API_KEY", key)
+				log.Println("info: REKOR_API_KEY seeded from YAML for this process")
+			}
+		}
+	}
+}
+
 func jsonOK(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -634,7 +733,12 @@ func getStringDeep(m map[string]any, pth []string) string {
 		case map[string]any:
 			cur = c[p]
 		case []any:
-			return ""
+			// allow numeric index in path (e.g., "0")
+			i, err := strconv.Atoi(p)
+			if err != nil || i < 0 || i >= len(c) {
+				return ""
+			}
+			cur = c[i]
 		default:
 			return ""
 		}
@@ -651,6 +755,12 @@ func getFloatDeep(m map[string]any, pth []string) *float64 {
 		switch c := cur.(type) {
 		case map[string]any:
 			cur = c[p]
+		case []any:
+			i, err := strconv.Atoi(p)
+			if err != nil || i < 0 || i >= len(c) {
+				return nil
+			}
+			cur = c[i]
 		default:
 			return nil
 		}
@@ -692,7 +802,7 @@ func saveBase64Image(db *sql.DB, eventID int64, b64 string, filename string) {
 		return
 	}
 
-	// Some payloads include data URI prefix like "data:image/jpeg;base64,..."
+	// Strip data URI prefix like "data:image/jpeg;base64,..."
 	if idx := strings.Index(b64, ","); idx > 0 && strings.Contains(b64[:idx], "base64") {
 		b64 = b64[idx+1:]
 	}
@@ -716,7 +826,6 @@ func saveBase64Image(db *sql.DB, eventID int64, b64 string, filename string) {
 		return
 	}
 
-	// Record or update images row (no uuid for base64 case)
 	_, _ = db.Exec(`INSERT INTO images(event_id, kind, uuid, path, status) VALUES(?, 'frame', '', ?, 'stored')`, eventID, dst)
 	log.Printf("images: stored base64 image -> %s", dst)
 }
@@ -727,14 +836,12 @@ func saveURLImage(db *sql.DB, eventID int64, rawURL, desiredName, authHeader str
 		log.Printf("images: mkdir error: %v", err)
 		return
 	}
-	// Validate URL
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		log.Printf("images: bad url %q: %v", rawURL, err)
 		return
 	}
 
-	// Name
 	name := desiredName
 	if name == "" {
 		base := path.Base(u.Path)
@@ -751,7 +858,6 @@ func saveURLImage(db *sql.DB, eventID int64, rawURL, desiredName, authHeader str
 				log.Printf("images: panic recovering: %v", r)
 			}
 		}()
-
 		client := &http.Client{Timeout: 8 * time.Second}
 		req, _ := http.NewRequest("GET", rawURL, nil)
 		if strings.TrimSpace(authHeader) != "" {
@@ -759,8 +865,6 @@ func saveURLImage(db *sql.DB, eventID int64, rawURL, desiredName, authHeader str
 			if len(parts) == 2 {
 				req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
 			} else {
-				// If they provide "Authorization: Bearer ..." as a whole string,
-				// we still set it under Authorization
 				req.Header.Set("Authorization", authHeader)
 			}
 		}
@@ -792,7 +896,6 @@ func saveURLImage(db *sql.DB, eventID int64, rawURL, desiredName, authHeader str
 	}()
 }
 
-// (optional) tiny util if we ever need it here; worker already has its own logic
 func requireEnv(key string) (string, error) {
 	val := strings.TrimSpace(os.Getenv(key))
 	if val == "" {
@@ -801,129 +904,154 @@ func requireEnv(key string) (string, error) {
 	return val, nil
 }
 
-const dashboardHTML = "<!doctype html>\n" +
-	"<html>\n" +
-	"<head>\n" +
-	"  <meta charset=\"utf-8\">\n" +
-	"  <title>Custom Data Receiver — Dashboard</title>\n" +
-	"  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n" +
-	"  <style>\n" +
-	"    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }\n" +
-	"    h1 { margin: 0 0 16px; }\n" +
-	"    .controls { display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap; }\n" +
-	"    input, select, button { padding:8px; font-size:14px; }\n" +
-	"    table { border-collapse: collapse; width: 100%; }\n" +
-	"    th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; }\n" +
-	"    th { background: #f8f8f8; position: sticky; top: 0; }\n" +
-	"    .muted { color: #666; font-size: 12px; }\n" +
-	"    .right { text-align:right; }\n" +
-	"  </style>\n" +
-	"</head>\n" +
-	"<body>\n" +
-	"  <h1>Events</h1>\n" +
-	"  <div class=\"controls\">\n" +
-	"    <label>Provider\n" +
-	"      <select id=\"provider\">\n" +
-	"        <option value=\"\">(all)</option>\n" +
-	"        <option value=\"rekor\">rekor</option>\n" +
-	"      </select>\n" +
-	"    </label>\n" +
-	"    <input id=\"plate\" placeholder=\"Plate filter (contains)\" />\n" +
-	"    <input id=\"q\" placeholder=\"Search (plate/camera/region)\" />\n" +
-	"    <button id=\"refresh\">Refresh</button>\n" +
-	"    <span class=\"muted\" id=\"status\"></span>\n" +
-	"  </div>\n" +
-	"  <div class=\"muted\" id=\"meta\"></div>\n" +
-	"  <table id=\"tbl\">\n" +
-	"    <thead>\n" +
-	"      <tr>\n" +
-	"        <th>Time (created)</th>\n" +
-	"        <th>Provider</th>\n" +
-	"        <th>Event Type</th>\n" +
-	"        <th>Plate</th>\n" +
-	"        <th class=\"right\">Conf</th>\n" +
-	"        <th>Camera</th>\n" +
-	"        <th>Region</th>\n" +
-	"        <th>Lat</th>\n" +
-	"        <th>Lon</th>\n" +
-	"      </tr>\n" +
-	"    </thead>\n" +
-	"    <tbody></tbody>\n" +
-	"  </table>\n" +
-	"<script>\n" +
-	"function esc(x){return (x===null||x===undefined)?'':String(x)}\n" +
-	"function fmtLocal(ts){\n" +
-	"  try{\n" +
-	"    if(!ts) return '';\n" +
-	"    if(/^\\d{13}$/.test(String(ts))){ const d=new Date(Number(ts)); if(!isNaN(d)) return d.toLocaleString(); }\n" +
-	"    if(/^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d+)?$/.test(ts)){ const d=new Date(ts.replace(' ','T')); if(!isNaN(d)) return d.toLocaleString(); }\n" +
-	"    const d=new Date(ts); if(!isNaN(d)) return d.toLocaleString();\n" +
-	"    return esc(ts);\n" +
-	"  }catch(e){ return esc(ts); }\n" +
-	"}\n" +
-	"async function load() {\n" +
-	"  const provider = document.getElementById('provider').value.trim();\n" +
-	"  const plate = document.getElementById('plate').value.trim();\n" +
-	"  const q = document.getElementById('q').value.trim();\n" +
-	"  const params = new URLSearchParams({ page: '1', page_size: '100' });\n" +
-	"  if (provider) params.set('provider', provider);\n" +
-	"  if (plate) params.set('plate', plate);\n" +
-	"  if (q) params.set('q', q);\n" +
-	"  const status = document.getElementById('status');\n" +
-	"  status.textContent = 'Loading…';\n" +
-	"  const res = await fetch('/events?' + params.toString());\n" +
-	"  const data = await res.json();\n" +
-	"  status.textContent = 'Last updated ' + new Date().toLocaleTimeString();\n" +
-	"  document.getElementById('meta').textContent = 'Showing ' + (data.events?.length || 0) + ' event(s) — page ' + data.page;\n" +
-	"  const tbody = document.querySelector('#tbl tbody');\n" +
-	"  tbody.innerHTML = '';\n" +
-	"  for (const e of (data.events || [])) {\n" +
-	"    const tr = document.createElement('tr');\n" +
-	"    const conf = (e.confidence==null)?'':Number(e.confidence).toFixed(1);\n" +
-	"    const details = '<a href=\"/event/' + e.id + '\">Details</a>';\n" +
-	"    tr.innerHTML = '<td>' + fmtLocal(e.created_at) + ' ' + details + '</td>' +\n" +
-	"                   '<td>' + esc(e.provider) + '</td>' +\n" +
-	"                   '<td>' + esc(e.event_type) + '</td>' +\n" +
-	"                   '<td>' + esc(e.plate) + '</td>' +\n" +
-	"                   '<td class=\"right\">' + conf + '</td>' +\n" +
-	"                   '<td>' + esc(e.camera_name) + '</td>' +\n" +
-	"                   '<td>' + esc(e.region) + '</td>' +\n" +
-	"                   '<td>' + esc(e.lat) + '</td>' +\n" +
-	"                   '<td>' + esc(e.lon) + '</td>';\n" +
-	"    tbody.appendChild(tr);\n" +
-	"  }\n" +
-	"}\n" +
-	"document.getElementById('refresh').addEventListener('click', load);\n" +
-	"load();\n" +
-	"setInterval(load, 10000);\n" +
-	"</script>\n" +
-	"</body>\n" +
-	"</html>\n"
+const dashboardHTML = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Custom Data Receiver — Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    h1 { margin: 0 0 16px; }
+    .controls { display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap; }
+    input, select, button { padding:8px; font-size:14px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background: #f8f8f8; position: sticky; top: 0; }
+    .muted { color: #666; font-size: 12px; }
+    .right { text-align:right; }
+  </style>
+</head>
+<body>
+  <h1>Events</h1>
+  <div class="controls">
+    <label>Provider
+      <select id="provider">
+        <option value="">(all)</option>
+        <option value="rekor">rekor</option>
+      </select>
+    </label>
+    <input id="plate" placeholder="Plate filter (contains)" />
+    <input id="q" placeholder="Search (plate/camera/region)" />
+    <button id="refresh">Refresh</button>
+    <span class="muted" id="status"></span>
+  </div>
+  <div class="muted" id="meta"></div>
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>Time (created)</th>
+        <th>Provider</th>
+        <th>Event Type</th>
+        <th>Plate</th>
+        <th class="right">Conf</th>
+        <th>Camera</th>
+        <th>Region</th>
+        <th>Lat</th>
+        <th>Lon</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+<script>
+function esc(x){return (x===null||x===undefined)?'':String(x)}
+function fmtLocal(ts){
+  try{
+    if(!ts) return '';
+    if(/^\\d{13}$/.test(String(ts))){ const d=new Date(Number(ts)); if(!isNaN(d)) return d.toLocaleString(); }
+    if(/^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d+)?$/.test(ts)){ const d=new Date(ts.replace(' ','T')); if(!isNaN(d)) return d.toLocaleString(); }
+    const d=new Date(ts); if(!isNaN(d)) return d.toLocaleString();
+    return esc(ts);
+  }catch(e){ return esc(ts); }
+}
+async function load() {
+  const provider = document.getElementById('provider').value.trim();
+  const plate = document.getElementById('plate').value.trim();
+  const q = document.getElementById('q').value.trim();
+  const params = new URLSearchParams({ page: '1', page_size: '100' });
+  if (provider) params.set('provider', provider);
+  if (plate) params.set('plate', plate);
+  if (q) params.set('q', q);
+  const status = document.getElementById('status');
+  status.textContent = 'Loading…';
+  const res = await fetch('/events?' + params.toString());
+  const data = await res.json();
+  status.textContent = 'Last updated ' + new Date().toLocaleTimeString();
+  document.getElementById('meta').textContent = 'Showing ' + (data.events?.length || 0) + ' event(s) — page ' + data.page;
+  const tbody = document.querySelector('#tbl tbody');
+  tbody.innerHTML = '';
+  for (const e of (data.events || [])) {
+    const tr = document.createElement('tr');
+    const conf = (e.confidence==null)?'':Number(e.confidence).toFixed(1);
+    const details = '<a href="/event/' + e.id + '">Details</a>';
+    tr.innerHTML = '<td>' + fmtLocal(e.created_at) + ' ' + details + '</td>' +
+                   '<td>' + esc(e.provider) + '</td>' +
+                   '<td>' + esc(e.event_type) + '</td>' +
+                   '<td>' + esc(e.plate) + '</td>' +
+                   '<td class="right">' + conf + '</td>' +
+                   '<td>' + esc(e.camera_name) + '</td>' +
+                   '<td>' + esc(e.region) + '</td>' +
+                   '<td>' + esc(e.lat) + '</td>' +
+                   '<td>' + esc(e.lon) + '</td>';
+    tbody.appendChild(tr);
+  }
+}
+document.getElementById('refresh').addEventListener('click', load);
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>`
 
-const eventHTML = "<!doctype html>\n" +
-	"<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>\n" +
-	"<title>Event</title>\n" +
-	"<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #ddd;padding:8px;text-align:left}th{background:#f8f8f8;position:sticky;top:0}.thumb{height:100px}</style>\n" +
-	"</head><body>\n" +
-	"<a href='/dashboard'>&larr; Back</a>\n" +
-	"<h1>Event Details</h1>\n" +
-	"<div id='meta'></div>\n" +
-	"<h2>Images</h2><div id='imgs'></div>\n" +
-	"<h2>Fields</h2>\n" +
-	"<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody id='fields'></tbody></table>\n" +
-	"<script>\n" +
-	"function esc(x){return (x===null||x===undefined)?'':String(x)}\n" +
-	"async function load(){\n" +
-	"  const id = location.pathname.split('/').pop();\n" +
-	"  const res = await fetch('/events/'+id);\n" +
-	"  const data = await res.json();\n" +
-	"  const e = data.event || {};\n" +
-	"  document.getElementById('meta').innerHTML = '<b>ID</b>: '+esc(e.id)+' &nbsp; <b>Provider</b>: '+esc(e.provider)+' &nbsp; <b>Type</b>: '+esc(e.event_type)+'<br><b>Plate</b>: '+esc(e.plate)+' &nbsp; <b>Camera</b>: '+esc(e.camera_name)+'<br><b>Created</b>: '+esc(e.created_at)+' &nbsp; <b>Occurred</b>: '+esc(e.occurred_at)+'<br><b>Region</b>: '+esc(e.region)+' &nbsp; <b>Conf</b>: '+esc(e.confidence)+' &nbsp; <b>GPS</b>: '+esc(e.lat)+', '+esc(e.lon);\n" +
-	"  const imgDiv = document.getElementById('imgs'); imgDiv.innerHTML='';\n" +
-	"  (data.images||[]).forEach(img=>{ const d=document.createElement('div'); d.style.display='inline-block'; d.style.margin='4px'; d.innerHTML = (img.image_url?('<img class=\"thumb\" src=\"'+img.image_url+'\"/>'):'(pending)') + '<br>'+esc(img.uuid)+'<br><span style=\"color:#666\">'+esc(img.status)+'</span>'; imgDiv.appendChild(d); });\n" +
-	"  const tb = document.getElementById('fields'); tb.innerHTML='';\n" +
-	"  (data.fields||[]).forEach(f=>{ const tr=document.createElement('tr'); tr.innerHTML='<td>'+esc(f.key)+'</td><td>'+esc(f.value)+'</td>'; tb.appendChild(tr); });\n" +
-	"}\n" +
-	"load();\n" +
-	"</script>\n" +
-	"</body></html>\n"
+const eventHTML = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Event</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px}
+    table{border-collapse:collapse;width:100%}
+    th,td{border-bottom:1px solid #ddd;padding:8px;text-align:left}
+    th{background:#f8f8f8;position:sticky;top:0}
+    .thumb{height:100px}
+  </style>
+</head>
+<body>
+<a href="/dashboard">&larr; Back</a>
+<h1>Event Details</h1>
+<div id="meta"></div>
+<h2>Images</h2><div id="imgs"></div>
+<h2>Fields</h2>
+<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody id="fields"></tbody></table>
+<script>
+function esc(x){return (x===null||x===undefined)?'':String(x)}
+async function load(){
+  const id = location.pathname.split('/').pop();
+  const res = await fetch('/events/'+id);
+  const data = await res.json();
+  const e = data.event || {};
+  document.getElementById('meta').innerHTML =
+    '<b>ID</b>: '+esc(e.id)+' &nbsp; <b>Provider</b>: '+esc(e.provider)+' &nbsp; <b>Type</b>: '+esc(e.event_type)+'<br>'+
+    '<b>Plate</b>: '+esc(e.plate)+' &nbsp; <b>Camera</b>: '+esc(e.camera_name)+'<br>'+
+    '<b>Created</b>: '+esc(e.created_at)+' &nbsp; <b>Occurred</b>: '+esc(e.occurred_at)+'<br>'+
+    '<b>Region</b>: '+esc(e.region)+' &nbsp; <b>Conf</b>: '+esc(e.confidence)+' &nbsp; <b>GPS</b>: '+esc(e.lat)+', '+esc(e.lon);
+  const imgDiv = document.getElementById('imgs'); imgDiv.innerHTML='';
+  (data.images||[]).forEach(img=>{
+    const d=document.createElement('div');
+    d.style.display='inline-block'; d.style.margin='4px';
+    d.innerHTML = (img.image_url?('<img class="thumb" src="'+img.image_url+'"/>'):'(pending)')
+                + '<br>'+esc(img.uuid)+'<br><span style="color:#666">'+esc(img.status)+'</span>';
+    imgDiv.appendChild(d);
+  });
+  const tb = document.getElementById('fields'); tb.innerHTML='';
+  (data.fields||[]).forEach(f=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td>'+esc(f.key)+'</td><td>'+esc(f.value)+'</td>';
+    tb.appendChild(tr);
+  });
+}
+load();
+</script>
+</body>
+</html>`
