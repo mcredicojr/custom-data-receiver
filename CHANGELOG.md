@@ -2,6 +2,21 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+### Added
+- Rekor: image fetch worker with support for agent_uid + uuid-based image URLs
+- Rekor: YAML config can seed `REKOR_API_KEY` env var (`auth_header: env REKOR_API_KEY=...`)
+- New debug endpoints:
+  - `/debug/queue` shows queued image jobs
+  - `/debug/images` lists images table
+  - `/debug/config` shows current Rekor image fetch config
+
+
+- rekor: image fetch worker, YAML env key support, debug endpoints### Changed
+- Webhook handler now stores base64/URL images immediately (fast path) and falls back to UUID fetch
+- Event detail page (`/event/{id}`) displays stored images and metadata
+
+## [Unreleased]
 - sqlite: enable WAL and busy_timeout(5s), and serialize connections to prevent SQLITE_BUSY under concurrent inserts.
 
 ## [Unreleased]
@@ -14,6 +29,7 @@ All notable changes to this project will be documented in this file.
 
 
 
+- rekor: image fetch worker, YAML env key support, debug endpoints
 - rekor: image fetch worker, YAML env key support, debug endpoints### Added (planned for v0.3.0)
 - Dashboard: image thumbnails column when `images.path` is present.
 - Dashboard: link to `/events/{id}` detail page.
@@ -53,7 +69,8 @@ All notable changes to this project will be documented in this file.
 ### Added
 - rekor: image fetch worker, YAML env key support, debug endpoints
 
-### Changed
+
+- rekor: image fetch worker, YAML env key support, debug endpoints### Changed
 - add next steps checklist under Unreleased
 
 
